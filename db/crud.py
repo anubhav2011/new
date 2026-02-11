@@ -78,6 +78,23 @@ def update_worker_data(worker_id: str, name: str, dob: str, address: str) -> boo
             return False
         logger.info(
             f"Successfully updated worker {worker_id} (rowcount={cursor.rowcount}) with personal_extracted_name and personal_extracted_dob")
+
+        # ============================================================================
+        # RESET EDUCATIONAL DOCUMENT VERIFICATION
+        # Since personal data has changed, educational verification is now invalid
+        # ============================================================================
+        logger.info(
+            f"Resetting educational document verification status for worker {worker_id} due to personal data update")
+
+        cursor.execute("""
+        UPDATE educational_documents
+        SET verification_status = NULL
+        WHERE worker_id = ?
+        """, (worker_id,))
+
+        logger.info(f"Reset educational document verification_status to NULL (rows affected: {cursor.rowcount})")
+        conn.commit()
+
         return True
     except Exception as e:
         logger.error(f"Error updating worker data {worker_id}: {str(e)}", exc_info=True)
@@ -1520,6 +1537,23 @@ def update_worker_verification(
             return False
 
         logger.info(f"✓ Updated verification status for worker {worker_id}: status={status}")
+
+        # ============================================================================
+        # RESET EDUCATIONAL DOCUMENT VERIFICATION (if personal data was updated)
+        # Since personal extracted data changed, educational verification is now invalid
+        # ============================================================================
+        if extracted_name is not None or extracted_dob is not None:
+            logger.info(f"Personal extracted data changed for worker {worker_id} - resetting educational verification")
+
+            cursor.execute("""
+            UPDATE educational_documents
+            SET verification_status = NULL
+            WHERE worker_id = ?
+            """, (worker_id,))
+
+            logger.info(f"Reset educational document verification_status to NULL (rows affected: {cursor.rowcount})")
+            conn.commit()
+
         return True
     except Exception as e:
         logger.error(f"Error updating worker verification for {worker_id}: {str(e)}", exc_info=True)
@@ -1612,12 +1646,15 @@ def save_educational_document_with_llm_data(
             # Record found → UPDATE
             cursor.execute("""
                 UPDATE educational_documents
-                SET board = ?, stream = ?, year_of_passing = ?, school_name = ?, 
+                SET document_type = ?, qualification = ?, board = ?, 
+                    stream = ?, year_of_passing = ?, school_name = ?, 
                     marks_type = ?, marks = ?, percentage = ?, 
                     raw_ocr_text = ?, llm_extracted_data = ?, 
                     extracted_name = ?, extracted_dob = ?, verification_status = ?
-                WHERE worker_id = ? AND document_type = ? AND qualification = ?
+                WHERE worker_id = ? 
             """, (
+                education_data.get("document_type"),
+                education_data.get("qualification"),
                 education_data.get("board"),
                 education_data.get("stream"),
                 education_data.get("year_of_passing"),
@@ -1630,9 +1667,7 @@ def save_educational_document_with_llm_data(
                 extracted_name if extracted_name else None,
                 extracted_dob if extracted_dob else None,
                 'pending',
-                worker_id,
-                education_data.get("document_type"),
-                education_data.get("qualification")
+                worker_id
             ))
         else:
             # Record not found → INSERT
@@ -1667,12 +1702,13 @@ def save_educational_document_with_llm_data(
         conn.commit()
 
         # Verify what was actually saved in the database
-        doc_id = cursor.lastrowid
+        # Instead of using lastrowid, query by worker_id
         cursor.execute("""
-        SELECT id, extracted_name, extracted_dob, verification_status 
-        FROM educational_documents 
-        WHERE id = ?
-        """, (doc_id,))
+        SELECT id, extracted_name, extracted_dob, verification_status
+        FROM educational_documents
+        WHERE worker_id = ?
+        """, (worker_id,))
+
         saved_row = cursor.fetchone()
 
         if saved_row:
@@ -1683,6 +1719,100 @@ def save_educational_document_with_llm_data(
             logger.info(f"[EDU+LLM SAVE]          status={saved_row[3]}")
         else:
             logger.warning(f"[EDU+LLM SAVE] ✗ Could not verify saved row in database")
+
+        # ============================================================================
+        # VERIFICATION LOGIC: Compare extracted educational data with personal data
+        # ============================================================================
+        logger.info(f"[EDU+LLM SAVE] [STEP 6] Starting verification comparison...")
+
+        cursor.execute("""
+            SELECT personal_extracted_name, personal_extracted_dob
+            FROM workers
+            WHERE worker_id = ?
+        """, (worker_id,))
+
+        personal_row = cursor.fetchone()
+
+        if personal_row:
+            personal_extracted_name = personal_row[0]
+            personal_extracted_dob = personal_row[1]
+
+            logger.info(f"[EDU+LLM SAVE] [VERIFICATION] Personal data retrieved:")
+            logger.info(f"[EDU+LLM SAVE]                 personal_name={repr(personal_extracted_name)}")
+            logger.info(f"[EDU+LLM SAVE]                 personal_dob={repr(personal_extracted_dob)}")
+            logger.info(f"[EDU+LLM SAVE] [VERIFICATION] Educational data to compare:")
+            logger.info(f"[EDU+LLM SAVE]                 edu_name={repr(extracted_name)}")
+            logger.info(f"[EDU+LLM SAVE]                 edu_dob={repr(extracted_dob)}")
+
+            # Verify only if both personal and educational data exist
+            if personal_extracted_name and personal_extracted_dob and extracted_name and extracted_dob:
+                # Normalize for comparison (case-insensitive, strip whitespace)
+                personal_name_normalized = personal_extracted_name.lower().strip()
+                edu_name_normalized = extracted_name.lower().strip()
+                personal_dob_normalized = str(personal_extracted_dob).strip()
+                edu_dob_normalized = str(extracted_dob).strip()
+
+                logger.info(f"[EDU+LLM SAVE] [VERIFICATION] Normalized comparison:")
+                logger.info(f"[EDU+LLM SAVE]                 personal_name_normalized={repr(personal_name_normalized)}")
+                logger.info(f"[EDU+LLM SAVE]                 edu_name_normalized={repr(edu_name_normalized)}")
+                logger.info(f"[EDU+LLM SAVE]                 personal_dob_normalized={repr(personal_dob_normalized)}")
+                logger.info(f"[EDU+LLM SAVE]                 edu_dob_normalized={repr(edu_dob_normalized)}")
+
+                # Check if they match
+                name_match = personal_name_normalized == edu_name_normalized
+                dob_match = personal_dob_normalized == edu_dob_normalized
+
+                logger.info(
+                    f"[EDU+LLM SAVE] [VERIFICATION] Match results: name_match={name_match}, dob_match={dob_match}")
+
+                if name_match and dob_match:
+                    # VERIFIED
+                    cursor.execute("""
+                        UPDATE educational_documents
+                        SET verification_status = 'VERIFIED'
+                        WHERE worker_id = ?
+                    """, (worker_id,))
+
+                    cursor.execute("""
+                        UPDATE workers
+                        SET verification_status = 'VERIFIED'
+                        WHERE worker_id = ?
+                    """, (worker_id,))
+
+                    conn.commit()
+                    logger.info(f"[EDU+LLM SAVE] ✓ VERIFICATION PASSED for worker {worker_id}: All data matches!")
+
+                else:
+                    # MISMATCH
+                    mismatch_details = f"Name mismatch: '{extracted_name}' vs '{personal_extracted_name}' | DOB mismatch: '{extracted_dob}' vs '{personal_extracted_dob}'"
+
+                    cursor.execute("""
+                        UPDATE educational_documents
+                        SET verification_status = 'MISMATCH',
+                            verification_errors = ?
+                        WHERE worker_id = ?
+                    """, (mismatch_details, worker_id))
+
+                    cursor.execute("""
+                        UPDATE workers
+                        SET verification_status = 'MISMATCH'
+                        WHERE worker_id = ?
+                    """, (worker_id,))
+
+                    conn.commit()
+                    logger.warning(f"[EDU+LLM SAVE] ✗ VERIFICATION FAILED for worker {worker_id}: {mismatch_details}")
+
+            else:
+                # Cannot verify yet - missing data
+                logger.info(f"[EDU+LLM SAVE] [VERIFICATION] Cannot verify - missing data:")
+                logger.info(f"[EDU+LLM SAVE]                 personal_name exists: {bool(personal_extracted_name)}")
+                logger.info(f"[EDU+LLM SAVE]                 personal_dob exists: {bool(personal_extracted_dob)}")
+                logger.info(f"[EDU+LLM SAVE]                 edu_name exists: {bool(extracted_name)}")
+                logger.info(f"[EDU+LLM SAVE]                 edu_dob exists: {bool(extracted_dob)}")
+                logger.info(f"[EDU+LLM SAVE] [VERIFICATION] Keeping status as 'pending' until all data available")
+        else:
+            logger.info(
+                f"[EDU+LLM SAVE] [VERIFICATION] No personal data found for worker {worker_id} - cannot verify yet")
 
         logger.info(f"[EDU+LLM SAVE] ✓ Educational document with LLM data saved successfully for {worker_id}")
         logger.info(f"[EDU+LLM SAVE] Name saved: {bool(extracted_name)}, DOB saved: {bool(extracted_dob)}")
@@ -1964,7 +2094,8 @@ def delete_educational_data(worker_id: str) -> bool:
         verification_status = NULL
         WHERE worker_id = ?
         """, (worker_id,))
-        logger.info(f"[DELETE_EDUCATIONAL] Cleared educational fields from workers table (rows affected: {cursor.rowcount})")
+        logger.info(
+            f"[DELETE_EDUCATIONAL] Cleared educational fields from workers table (rows affected: {cursor.rowcount})")
 
         # Delete all educational document records for this worker
         # This completely removes the rows, leaving only the worker_id reference in the foreign key
