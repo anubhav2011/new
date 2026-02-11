@@ -1797,6 +1797,8 @@ async def trigger_ocr_and_voice(worker_id: str, personal_doc_path: str, educatio
                                 education_data = {
                                     "document_type": "marksheet",
                                     "qualification": education_extracted.get("qualification", ""),
+                                    "name": education_extracted.get("name", ""),
+                                    "dob": education_extracted.get("dob", ""),
                                     "board": education_extracted.get("board", ""),
                                     "stream": education_extracted.get("stream", ""),
                                     "year_of_passing": education_extracted.get("year_of_passing", ""),
@@ -1808,7 +1810,13 @@ async def trigger_ocr_and_voice(worker_id: str, personal_doc_path: str, educatio
                                 }
 
                                 logger.info(f"Saving education data to database for worker {worker_id}...")
-                                success = crud.save_educational_document(worker_id, education_data)
+                                # Use save_educational_document_with_llm_data for proper verification
+                                success = crud.save_educational_document_with_llm_data(
+                                    worker_id=worker_id,
+                                    education_data=education_data,
+                                    raw_ocr_text=education_ocr_text,
+                                    llm_data=education_extracted
+                                )
                                 if not success:
                                     logger.error(f"Failed to save educational document for {worker_id}")
                                     raise HTTPException(
